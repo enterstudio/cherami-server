@@ -26,7 +26,6 @@ import (
 	"time"
 
 	"github.com/uber-common/bark"
-	"github.com/uber/tchannel-go/thrift"
 
 	"github.com/uber/cherami-server/common"
 	"github.com/uber/cherami-server/common/metrics"
@@ -35,7 +34,6 @@ import (
 )
 
 const ackLevelInterval = 5 * time.Second
-const metaContextTimeout = 10 * time.Second
 
 type storeHostAddress int64
 
@@ -47,16 +45,12 @@ type (
 	}
 
 	levels struct {
-		asOf          common.UnixNanoTime   // Timestamp when this backLogLevel was calculated
-		readLevel     common.SequenceNumber // -1 = nothing received, 0 = 1 message (#0) received, etc.
-		ackLevel      common.SequenceNumber // -1 = nothing acked
-		ackLevelRate  float64               // Rate of change in ackedTo, seconds⁽⁻¹⁾
-		readLevelRate float64               // Rate of change in receivedTo, seconds⁽⁻¹⁾
-		ackLevelAddr  storeHostAddress      // Storehost address corresponding to ackLevel, -1 = nothing acked
-		readLevelAddr storeHostAddress      // Storehost address corresponding to recievedLevel, -1 = nothing read
-		lastAckedSeq  common.SequenceNumber // the latest sequence which is acked
+		asOf      common.UnixNanoTime   // Timestamp when this level was calculated
+		readLevel common.SequenceNumber // -1 = nothing received, 0 = 1 message (#0) received, etc.
+		ackLevel  common.SequenceNumber // -1 = nothing acked
+		lastAckedSeq common.SequenceNumber // the latest sequence which is acked
 	}
-
+	
 	// ackManager is held per CG extent and it holds the addresses that we get from the store.
 	ackManager struct {
 		addrs              map[common.SequenceNumber]*internalMsg // ‡
@@ -65,12 +59,11 @@ type (
 		cgUUID             string
 		extUUID            string
 		connectedStoreUUID *string
-		*levels                    // ‡ the current levels
-		prev               *levels // ‡ the previous levels
+		*levels            // ‡ the current levels
 		ackLevelTicker     *time.Ticker
 		closeChannel       chan struct{}
 		waitConsumed       chan<- bool // waitConsumed is the channel which will signal if the extent is completely consumed given by extentCache
-		metaclient         metadata.TChanMetadataService
+		committer          Committer
 		doneWG             sync.WaitGroup
 		logger             bark.Logger
 		sessionID          uint16
@@ -81,7 +74,7 @@ type (
 	}
 )
 
-func newAckManager(cgCache *consumerGroupCache, ackMgrID uint32, outputHostUUID string, cgUUID string, extUUID string, connectedStoreUUID *string, waitConsumedCh chan<- bool, cge *metadata.ConsumerGroupExtent, metaclient metadata.TChanMetadataService, logger bark.Logger) *ackManager {
+func newAckManager(cgCache *consumerGroupCache, ackMgrID uint32, outputHostUUID string, cgUUID string, extUUID string, connectedStoreUUID *string, waitConsumedCh chan<- bool, cge *metadata.ConsumerGroupExtent, committer Committer, logger bark.Logger) *ackManager {
 	ackMgr := &ackManager{
 		addrs:              make(map[common.SequenceNumber]*internalMsg),
 		cgCache:            cgCache,
@@ -91,26 +84,15 @@ func newAckManager(cgCache *consumerGroupCache, ackMgrID uint32, outputHostUUID 
 		connectedStoreUUID: connectedStoreUUID,
 		sessionID:          cgCache.sessionID, //sessionID,
 		ackMgrID:           uint16(ackMgrID),  //ackMgrID,
-		metaclient:         metaclient,
+		committer:          committer,
 		ackLevelTicker:     time.NewTicker(ackLevelInterval),
 		waitConsumed:       waitConsumedCh,
 		logger:             logger.WithField(common.TagModule, `ackMgr`),
 	}
 
-	// Set the previous levels now, so that on our first update, we will calculate rates correctly
-	ackMgr.prev = &levels{
-		asOf:          common.Now(),
-		readLevel:     common.SequenceNumber(cge.GetAckLevelSeqNo()),
-		ackLevel:      common.SequenceNumber(cge.GetAckLevelSeqNo()),
-		ackLevelAddr:  storeHostAddress(cge.GetAckLevelOffset()),
-		readLevelAddr: storeHostAddress(cge.GetReadLevelOffset()),
-	}
-
 	ackMgr.levels = &levels{
-		readLevel:     common.SequenceNumber(cge.GetAckLevelSeqNo()),
-		ackLevel:      common.SequenceNumber(cge.GetAckLevelSeqNo()),
-		ackLevelAddr:  storeHostAddress(cge.GetAckLevelOffset()),
-		readLevelAddr: storeHostAddress(cge.GetReadLevelOffset()),
+		readLevel: common.SequenceNumber(cge.GetAckLevelSeqNo()),
+		ackLevel:  common.SequenceNumber(cge.GetAckLevelSeqNo()),
 	}
 
 	return ackMgr
@@ -122,7 +104,6 @@ func newAckManager(cgCache *consumerGroupCache, ackMgrID uint32, outputHostUUID 
 func (ackMgr *ackManager) getNextAckID(address int64, sequence common.SequenceNumber) (ackID string) {
 	ackMgr.lk.Lock()
 	ackMgr.readLevel++ // This means that the first ID is '1'
-	ackMgr.readLevelAddr = storeHostAddress(address)
 
 	expectedReadLevel := ackMgr.levelOffset + ackMgr.readLevel
 
@@ -153,6 +134,12 @@ func (ackMgr *ackManager) getNextAckID(address int64, sequence common.SequenceNu
 	ackMgr.addrs[ackMgr.readLevel] = &internalMsg{
 		addr: storeHostAddress(address),
 	}
+
+	// Let the committer know about the new read level
+	ackMgr.committer.Read(CommitterLevel{
+		seqNo:   sequence,
+		address: storeHostAddress(address),
+	})
 
 	ackMgr.lk.Unlock()
 
@@ -241,9 +228,8 @@ func (ackMgr *ackManager) notifySealed() {
 func (ackMgr *ackManager) updateAckLevel() {
 	update := false
 	consumed := false
-	var oReq *metadata.SetAckOffsetRequest
-
 	ackMgr.lk.Lock()
+	var ackLevelAddress int64
 
 	count := 0
 	stop := ackMgr.ackLevel + common.SequenceNumber(int64(len(ackMgr.addrs)))
@@ -255,6 +241,14 @@ func (ackMgr *ackManager) updateAckLevel() {
 			if addrs.acked {
 				update = true
 				ackMgr.ackLevel = curr
+				ackLevelAddress = int64(addrs.addr)
+				
+				// We need to commit every message we see here, since we may have an interleved stream,
+				// and only the committer knows how to report the level(s). This is true, e.g. for Kafka.
+				ackMgr.committer.Commit(CommitterLevel{
+					seqNo:   ackMgr.ackLevel + ackMgr.levelOffset,
+					address: addrs.addr,
+				})
 
 				// getCurrentAckLevelOffset needs addr[ackMgr.ackLevel], so delete the previous one if it exists
 				count++
@@ -269,65 +263,28 @@ func (ackMgr *ackManager) updateAckLevel() {
 	// We can mark an extent as consumed, if we have both these conditions:
 	// 1. The extent is sealed (which means we have it marked after receiving the last message)
 	// 2. The ackLevel has reached the end (which means that the ackLevel equals the readLevel)
+	if ackMgr.sealed {
+		ackMgr.committer.Final(CommitterLevel{
+			seqNo:   ackMgr.readLevel,
+			address: ackMgr.addrs[ackMgr.readLevel].addr,
+		})
+	}
+
 	if ackMgr.sealed && ackMgr.ackLevel == ackMgr.readLevel {
 		ackMgr.logger.Debug("extent sealed and consumed")
 		consumed = true
 		update = true
 	}
 
-	// check if ackLevel is valid here and get the addr here
-	if _, ok := ackMgr.addrs[ackMgr.ackLevel]; ok {
-		ackMgr.ackLevelAddr = ackMgr.addrs[ackMgr.ackLevel].addr
-	}
-
-	if update {
-		ackMgr.asOf = common.Now()
-		oReq = &metadata.SetAckOffsetRequest{
-			OutputHostUUID:     common.StringPtr(ackMgr.outputHostUUID),
-			ConsumerGroupUUID:  common.StringPtr(ackMgr.cgUUID),
-			ExtentUUID:         common.StringPtr(ackMgr.extUUID),
-			ConnectedStoreUUID: common.StringPtr(*ackMgr.connectedStoreUUID),
-			AckLevelAddress:    common.Int64Ptr(int64(ackMgr.ackLevelAddr)),
-			AckLevelSeqNo:      common.Int64Ptr(int64(ackMgr.levelOffset + ackMgr.ackLevel)), // levelOffset adjusts the level according to what was returned from getAddressFromTimestamp
-			ReadLevelAddress:   common.Int64Ptr(int64(ackMgr.readLevelAddr)),
-			ReadLevelSeqNo:     common.Int64Ptr(int64(ackMgr.levelOffset + ackMgr.readLevel)),
-		}
-
-		// check if we can set the status as consumed
-		if consumed {
-			oReq.Status = common.CheramiConsumerGroupExtentStatusPtr(metadata.ConsumerGroupExtentStatus_CONSUMED)
-			// Rates are forced to zero in the consumed case
-			oReq.AckLevelSeqNoRate = common.Float64Ptr(0e0)
-			oReq.ReadLevelSeqNoRate = common.Float64Ptr(0e0)
-		} else {
-			oReq.Status = common.CheramiConsumerGroupExtentStatusPtr(metadata.ConsumerGroupExtentStatus_OPEN)
-			oReq.AckLevelSeqNoRate = common.Float64Ptr(common.CalculateRate(ackMgr.prev.ackLevel, ackMgr.ackLevel, ackMgr.prev.asOf, ackMgr.asOf))
-			oReq.ReadLevelSeqNoRate = common.Float64Ptr(common.CalculateRate(ackMgr.prev.readLevel, ackMgr.readLevel, ackMgr.prev.asOf, ackMgr.asOf))
-		}
-
-		// move the current levels to prev and replace the current levels with a deep copy
-		ackMgr.prev = ackMgr.levels
-		ackMgr.levels = &levels{}
-		*ackMgr.levels = *ackMgr.prev
-	}
-
 	updatedSize := len(ackMgr.addrs)
 	ackMgr.lk.Unlock()
 
 	if update {
-		ctx, cancel := thrift.NewContext(metaContextTimeout)
-		defer cancel()
-		// check if we can set the status as consumed
-		// ackMgr.logger.
-		//	WithField(common.TagCnsm, common.FmtCnsm(ackMgr.cgUUID)).
-		//	WithField(common.TagExt, common.FmtExt(ackMgr.extUUID)).
-		//	WithField(`ackLevelAddress`, oReq.GetAckLevelAddress()).
-		//	Debug(`outputhost: Setting ackLevel`)
-
-		if err := ackMgr.metaclient.SetAckOffset(ctx, oReq); err != nil {
+		ackMgr.asOf = common.Now()
+		if err := ackMgr.committer.Flush(); err != nil {
 			ackMgr.logger.WithFields(bark.Fields{
 				common.TagErr:     err,
-				`ackLevelAddress`: oReq.GetAckLevelAddress(),
+				`ackLevelAddress`: ackLevelAddress,
 			}).Error(`error updating ackLevel`)
 		} else {
 			// Updating metadata succeeded; report some metrics and mark the extent as consumed if necessary
@@ -343,7 +300,7 @@ func (ackMgr *ackManager) updateAckLevel() {
 				// deadlock during unload
 				select {
 				case ackMgr.waitConsumed <- true:
-					ackMgr.logger.WithField(`ackLevelAddress`, oReq.GetAckLevelAddress()).Info(`extent consumed`)
+					ackMgr.logger.WithField(`ackLevelAddress`, ackLevelAddress).Info(`extent consumed`)
 				default:
 				}
 			}
@@ -451,12 +408,16 @@ func (ackMgr *ackManager) getAckMgrState() *admin.AckMgrState {
 	ackMgrState := admin.NewAckMgrState()
 	ackMgr.lk.RLock()
 	defer ackMgr.lk.RUnlock()
+
+	c := ackMgr.committer.GetCommit()
+	r := ackMgr.committer.GetRead()
+
 	ackMgrState.AckMgrID = common.Int16Ptr(int16(ackMgr.ackMgrID))
 	ackMgrState.IsSealed = common.BoolPtr(ackMgr.sealed)
 	ackMgrState.ReadLevelSeq = common.Int64Ptr(int64(ackMgr.readLevel))
 	ackMgrState.AckLevelSeq = common.Int64Ptr(int64(ackMgr.ackLevel))
-	ackMgrState.ReadLevelOffset = common.Int64Ptr(int64(ackMgr.readLevelAddr))
-	ackMgrState.AckLevelOffset = common.Int64Ptr(int64(ackMgr.ackLevelAddr))
+	ackMgrState.ReadLevelOffset = common.Int64Ptr(int64(r.address))
+	ackMgrState.AckLevelOffset = common.Int64Ptr(int64(c.address))
 	ackMgrState.LastAckLevelUpdateTime = common.Int64Ptr(int64(ackMgr.asOf))
 	ackMgrState.LastAckedSeq = common.Int64Ptr(int64(ackMgr.lastAckedSeq))
 	ackMgrState.NumAckedMsgs, ackMgrState.NumUnackedMsgs = ackMgr.getNumAckedAndUnackedMessages()

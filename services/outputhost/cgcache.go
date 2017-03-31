@@ -335,8 +335,27 @@ func (cgCache *consumerGroupCache) loadExtentCache(ctx thrift.Context, destType 
 		if err == nil {
 			extCache.initialCredits = cgCache.getMessageCacheSize(cfg, defaultNumOutstandingMsgs)
 		}
-		// TODO: create a newAckManagerRequestArgs struct here
-		extCache.ackMgr = newAckManager(cgCache, cgCache.ackIDGen.GetNextAckID(), cgCache.outputHostUUID, cgCache.cachedCGDesc.GetConsumerGroupUUID(), extCache.extUUID, &extCache.connectedStoreUUID, extCache.waitConsumedCh, cge, cgCache.metaClient, extCache.logger)
+
+		committer := NewCheramiCommitter(
+			cgCache.metaClient,
+			cgCache.outputHostUUID,
+			cgCache.cachedCGDesc.GetConsumerGroupUUID(),
+			extCache.extUUID,
+			&extCache.connectedStoreUUID,
+		)
+
+		extCache.ackMgr = newAckManager(
+			cgCache,
+			cgCache.ackIDGen.GetNextAckID(),
+			cgCache.outputHostUUID,
+			cgCache.cachedCGDesc.GetConsumerGroupUUID(),
+			extCache.extUUID,
+			&extCache.connectedStoreUUID,
+			extCache.waitConsumedCh,
+			cge,
+			committer,
+			extCache.logger,
+		)
 		extCache.loadReporter = cgCache.loadReporterFactory.CreateReporter(extentLoadReportingInterval, extCache, extCache.logger)
 
 		// make sure we prevent shutdown from racing
