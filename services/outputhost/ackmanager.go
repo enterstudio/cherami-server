@@ -276,11 +276,14 @@ func (ackMgr *ackManager) updateAckLevel() {
 		update = true
 	}
 
+	if update {
+		ackMgr.asOf = common.Now()
+	}
+
 	updatedSize := len(ackMgr.addrs)
 	ackMgr.lk.Unlock()
 
 	if update {
-		ackMgr.asOf = common.Now()
 		if err := ackMgr.committer.Flush(); err != nil {
 			ackMgr.logger.WithFields(bark.Fields{
 				common.TagErr:     err,
