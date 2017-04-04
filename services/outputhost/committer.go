@@ -20,7 +20,10 @@
 
 package outputhost
 
-import "github.com/uber/cherami-server/common"
+import (
+	"github.com/uber/cherami-server/common"
+	"sync"
+)
 
 // Committer is an interface that wraps the internals of how offsets/acklevels are committed for a given queueing
 // system (e.g. Kafka or Cherami)
@@ -31,26 +34,26 @@ type (
 	}
 
 	Committer interface {
-		// Commit indicates that work up to and including the message specified by the sequence number and address
+		// SetCommitLevel indicates that work up to and including the message specified by the sequence number and address
 		// has been acknowledged. Not guaranteed to be persisted until a successful call to Flush()
-		Commit(l CommitterLevel)
+		SetCommitLevel(l CommitterLevel)
 
-		// Read indicates that a particular message has been read. Metadata not guaranteed to be communicated/persisted
+		// SetReadLevel indicates that a particular message has been read. Metadata not guaranteed to be communicated/persisted
 		// until a successful call to Flush()
-		Read(l CommitterLevel)
+		SetReadLevel(l CommitterLevel)
 
-		// Final indicates that a particular level is the last that can possibly be read. Metadata not guaranteed
+		// SetFinalLevel indicates that a particular level is the last that can possibly be read. Metadata not guaranteed
 		// to be communicated/persisted until a successful call to Flush()
-		Final(l CommitterLevel)
+		SetFinalLevel(l CommitterLevel)
 
-		// Flush pushes accumulated commit/read state to durable storage, e.g. Kafka offset storage or Cherami-Cassandra
-		// AckLevel storage
-		Flush() error
+		// UnlockAndFlush copies accumulated commit/read state, unlocks the provided lock, and then commits 
+		// the levels to durable storage, e.g. Kafka offset storage or Cherami-Cassandra AckLevel storage
+		UnlockAndFlush(l sync.Locker) error
 
-		// GetCommit receives the last value given to Commit()
-		GetCommit() (l CommitterLevel)
+		// GetCommitLevel receives the last value given to Commit()
+		GetCommitLevel() (l CommitterLevel)
 
-		// GetRead receives the last value given to Read()
-		GetRead() (l CommitterLevel)
+		// GetReadLevel receives the last value given to Read()
+		GetReadLevel() (l CommitterLevel)
 	}
 )

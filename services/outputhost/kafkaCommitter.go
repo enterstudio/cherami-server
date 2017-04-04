@@ -37,7 +37,6 @@ type kafkaCommitter struct {
 	readLevel          CommitterLevel
 	finalLevel         CommitterLevel
 	metaclient         metadata.TChanMetadataService
-	m                  sync.Mutex
 	*sc.OffsetStash
 	*sc.Consumer
 	KafkaOffsetMetadata
@@ -64,52 +63,43 @@ const kafkaOffsetMetadataVersion = uint(0) // Current version of the KafkaOffset
  * Committer interface
  */
 
-// Commit just updates the next Cherami ack level that will be flushed
-func (c *kafkaCommitter) Commit(l CommitterLevel) {
-	c.m.Lock()
+// SetCommitLevel just updates the next Cherami ack level that will be flushed
+func (c *kafkaCommitter) SetCommitLevel(l CommitterLevel) {
 	c.commitLevel = l
 	tp, offset := kafkaAddresser.GetTopicPartitionOffset(l.address, c.getLogFn())
 	if tp != nil {
 		c.OffsetStash.MarkPartitionOffset(tp.Topic, tp.Partition, offset, c.metadataString)
 	}
-	c.m.Unlock()
 }
 
-// Read just updates the next Cherami read level that will be flushed
-func (c *kafkaCommitter) Read(l CommitterLevel) {
-	c.m.Lock()
+// SetReadLevel just updates the next Cherami read level that will be flushed
+func (c *kafkaCommitter) SetReadLevel(l CommitterLevel) {
 	c.readLevel = l
-	c.m.Unlock()
 }
 
-// Final just updates the last possible read level
-func (c *kafkaCommitter) Final(l CommitterLevel) {
-	c.m.Lock()
+// SetFinalLevel just updates the last possible read level
+func (c *kafkaCommitter) SetFinalLevel(l CommitterLevel) {
 	c.finalLevel = l
-	c.m.Unlock()
 }
 
-// Flush pushes our commit and read levels to Cherami metadata, using SetAckOffset
-func (c *kafkaCommitter) Flush() error {
-	c.m.Lock()
-	c.MarkOffsets(c.OffsetStash)
-	c.m.Unlock()
+// UnlockAndFlush pushes our commit and read levels to Cherami metadata, using SetAckOffset
+func (c *kafkaCommitter) UnlockAndFlush(l sync.Locker) error {
+	os := c.OffsetStash
+	c.OffsetStash = sc.NewOffsetStash()
+	l.Unlock() // MarkOffsets may take some time, so we unlock the thread that owns us
+	c.MarkOffsets(os)
 	return nil
 }
 
-// GetRead returns the next readlevel that will be flushed
-func (c *kafkaCommitter) GetRead() (l CommitterLevel) {
-	c.m.Lock()
+// GetReadLevel returns the next readlevel that will be flushed
+func (c *kafkaCommitter) GetReadLevel() (l CommitterLevel) {
 	l = c.readLevel
-	c.m.Unlock()
 	return
 }
 
-// GetCommit returns the next commit level that will be flushed
-func (c *kafkaCommitter) GetCommit() (l CommitterLevel) {
-	c.m.Lock()
+// GetCommitLevel returns the next commit level that will be flushed
+func (c *kafkaCommitter) GetCommitLevel() (l CommitterLevel) {
 	l = c.commitLevel
-	c.m.Unlock()
 	return
 }
 

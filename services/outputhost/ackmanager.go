@@ -45,12 +45,12 @@ type (
 	}
 
 	levels struct {
-		asOf      common.UnixNanoTime   // Timestamp when this level was calculated
-		readLevel common.SequenceNumber // -1 = nothing received, 0 = 1 message (#0) received, etc.
-		ackLevel  common.SequenceNumber // -1 = nothing acked
+		asOf         common.UnixNanoTime   // Timestamp when this level was calculated
+		readLevel    common.SequenceNumber // -1 = nothing received, 0 = 1 message (#0) received, etc.
+		ackLevel     common.SequenceNumber // -1 = nothing acked
 		lastAckedSeq common.SequenceNumber // the latest sequence which is acked
 	}
-	
+
 	// ackManager is held per CG extent and it holds the addresses that we get from the store.
 	ackManager struct {
 		addrs              map[common.SequenceNumber]*internalMsg // ‡
@@ -63,7 +63,7 @@ type (
 		ackLevelTicker     *time.Ticker
 		closeChannel       chan struct{}
 		waitConsumed       chan<- bool // waitConsumed is the channel which will signal if the extent is completely consumed given by extentCache
-		committer          Committer
+		committer          Committer   // ‡
 		doneWG             sync.WaitGroup
 		logger             bark.Logger
 		sessionID          uint16
@@ -136,7 +136,7 @@ func (ackMgr *ackManager) getNextAckID(address int64, sequence common.SequenceNu
 	}
 
 	// Let the committer know about the new read level
-	ackMgr.committer.Read(CommitterLevel{
+	ackMgr.committer.SetReadLevel(CommitterLevel{
 		seqNo:   sequence,
 		address: storeHostAddress(address),
 	})
@@ -226,10 +226,9 @@ func (ackMgr *ackManager) notifySealed() {
 }
 
 func (ackMgr *ackManager) updateAckLevel() {
-	update := false
-	consumed := false
-	ackMgr.lk.Lock()
+	var update, consumed bool
 	var ackLevelAddress int64
+	ackMgr.lk.Lock()
 
 	count := 0
 	stop := ackMgr.ackLevel + common.SequenceNumber(int64(len(ackMgr.addrs)))
@@ -242,10 +241,10 @@ func (ackMgr *ackManager) updateAckLevel() {
 				update = true
 				ackMgr.ackLevel = curr
 				ackLevelAddress = int64(addrs.addr)
-				
+
 				// We need to commit every message we see here, since we may have an interleved stream,
 				// and only the committer knows how to report the level(s). This is true, e.g. for Kafka.
-				ackMgr.committer.Commit(CommitterLevel{
+				ackMgr.committer.SetCommitLevel(CommitterLevel{
 					seqNo:   ackMgr.ackLevel + ackMgr.levelOffset,
 					address: addrs.addr,
 				})
@@ -264,9 +263,9 @@ func (ackMgr *ackManager) updateAckLevel() {
 	// 1. The extent is sealed (which means we have it marked after receiving the last message)
 	// 2. The ackLevel has reached the end (which means that the ackLevel equals the readLevel)
 	if ackMgr.sealed {
-		ackMgr.committer.Final(CommitterLevel{
-			seqNo:   ackMgr.readLevel,
-			address: ackMgr.addrs[ackMgr.readLevel].addr,
+		ackMgr.committer.SetFinalLevel(CommitterLevel{
+			seqNo:   ackMgr.committer.GetReadLevel().seqNo,
+			address: ackMgr.committer.GetReadLevel().address,
 		})
 	}
 
@@ -276,15 +275,11 @@ func (ackMgr *ackManager) updateAckLevel() {
 		update = true
 	}
 
+	updatedSize := len(ackMgr.addrs)
+
 	if update {
 		ackMgr.asOf = common.Now()
-	}
-
-	updatedSize := len(ackMgr.addrs)
-	ackMgr.lk.Unlock()
-
-	if update {
-		if err := ackMgr.committer.Flush(); err != nil {
+		if err := ackMgr.committer.UnlockAndFlush(&ackMgr.lk); err != nil { // implicit ackMgr.lk.Unlock()
 			ackMgr.logger.WithFields(bark.Fields{
 				common.TagErr:     err,
 				`ackLevelAddress`: ackLevelAddress,
@@ -308,6 +303,8 @@ func (ackMgr *ackManager) updateAckLevel() {
 				}
 			}
 		}
+	} else {
+		ackMgr.lk.Unlock()
 	}
 
 	// Report the size of the ackMgr map, if greater than 0
@@ -412,8 +409,8 @@ func (ackMgr *ackManager) getAckMgrState() *admin.AckMgrState {
 	ackMgr.lk.RLock()
 	defer ackMgr.lk.RUnlock()
 
-	c := ackMgr.committer.GetCommit()
-	r := ackMgr.committer.GetRead()
+	c := ackMgr.committer.GetCommitLevel()
+	r := ackMgr.committer.GetReadLevel()
 
 	ackMgrState.AckMgrID = common.Int16Ptr(int16(ackMgr.ackMgrID))
 	ackMgrState.IsSealed = common.BoolPtr(ackMgr.sealed)

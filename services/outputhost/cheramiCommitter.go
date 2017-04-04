@@ -41,38 +41,29 @@ type cheramiCommitter struct {
 	readLevel          CommitterLevel
 	finalLevel         CommitterLevel
 	metaclient         metadata.TChanMetadataService
-	m                  sync.Mutex
 }
 
 /*
  * Committer interface
  */
 
-// Commit just updates the next Cherami ack level that will be flushed
-func (c *cheramiCommitter) Commit(l CommitterLevel) {
-	c.m.Lock()
+// SetCommitLevel just updates the next Cherami ack level that will be flushed
+func (c *cheramiCommitter) SetCommitLevel(l CommitterLevel) {
 	c.commitLevel = l
-	c.m.Unlock()
 }
 
-// Read just updates the next Cherami read level that will be flushed
-func (c *cheramiCommitter) Read(l CommitterLevel) {
-	c.m.Lock()
+// SetReadLevel just updates the next Cherami read level that will be flushed
+func (c *cheramiCommitter) SetReadLevel(l CommitterLevel) {
 	c.readLevel = l
-	c.m.Unlock()
 }
 
-// Final just updates the last possible read level
-func (c *cheramiCommitter) Final(l CommitterLevel) {
-	c.m.Lock()
+// SetFinalLevel just updates the last possible read level
+func (c *cheramiCommitter) SetFinalLevel(l CommitterLevel) {
 	c.finalLevel = l
-	c.m.Unlock()
 }
 
-// Flush pushes our commit and read levels to Cherami metadata, using SetAckOffset
-func (c *cheramiCommitter) Flush() error {
-	c.m.Lock()
-	defer c.m.Unlock()
+// UnlockAndFlush pushes our commit and read levels to Cherami metadata, using SetAckOffset
+func (c *cheramiCommitter) UnlockAndFlush(l sync.Locker) error {
 	ctx, cancel := thrift.NewContext(metaContextTimeout)
 	defer cancel()
 
@@ -93,6 +84,9 @@ func (c *cheramiCommitter) Flush() error {
 			oReq.Status = common.CheramiConsumerGroupExtentStatusPtr(metadata.ConsumerGroupExtentStatus_CONSUMED)
 		}
 	}
+	
+	// At this point we have the final state to be committed, just need to commit it, which may take some time
+	l.Unlock()
 
 	return c.metaclient.SetAckOffset(ctx, oReq)
 }
@@ -116,18 +110,14 @@ func NewCheramiCommitter(metaclient metadata.TChanMetadataService,
 	}
 }
 
-// GetRead returns the next readlevel that will be flushed
-func (c *cheramiCommitter) GetRead() (l CommitterLevel) {
-	c.m.Lock()
+// GetReadLevel returns the next readlevel that will be flushed
+func (c *cheramiCommitter) GetReadLevel() (l CommitterLevel) {
 	l = c.readLevel
-	c.m.Unlock()
 	return
 }
 
-// GetCommit returns the next commit level that will be flushed
-func (c *cheramiCommitter) GetCommit() (l CommitterLevel) {
-	c.m.Lock()
+// GetCommitLevel returns the next commit level that will be flushed
+func (c *cheramiCommitter) GetCommitLevel() (l CommitterLevel) {
 	l = c.commitLevel
-	c.m.Unlock()
 	return
 }

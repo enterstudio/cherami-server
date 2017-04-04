@@ -21,6 +21,7 @@
 package outputhost
 
 import (
+	"sync/atomic"
 	"errors"
 	"strconv"
 
@@ -39,6 +40,7 @@ type kafkaStream struct {
 	creditSemaphore common.UnboundedSemaphore
 	kafkaMsgsCh     <-chan *s.ConsumerMessage
 	logger          bark.Logger
+	seqNo           int64
 }
 
 var kafkaErrNilControlFlow = errors.New(`nil or non-positive controlFlow passed to Write()`)
@@ -73,7 +75,7 @@ func (k *kafkaStream) Read() (*store.ReadMessageContent, error) {
 		k.creditSemaphore.Release(1) // TODO: size-based credits
 		return nil, kafkaErrClosed
 	}
-	return convertKafkaMessageToCherami(m, k.logger), nil
+	return k.convertKafkaMessageToCherami(m, k.logger), nil
 }
 
 // ResponseHeaders returns the response headers sent from the server. This will block until server headers have been received.
@@ -93,7 +95,7 @@ func OpenKafkaStream(c *sc.Consumer, logger bark.Logger) stream.BStoreOpenReadSt
 	return k
 }
 
-func convertKafkaMessageToCherami(k *s.ConsumerMessage, logger bark.Logger) (c *store.ReadMessageContent) {
+func (s *kafkaStream) convertKafkaMessageToCherami(k *s.ConsumerMessage, logger bark.Logger) (c *store.ReadMessageContent) {
 	c = &store.ReadMessageContent{
 		Type: store.ReadMessageContentTypePtr(store.ReadMessageContentType_MESSAGE),
 	}
@@ -117,7 +119,7 @@ func convertKafkaMessageToCherami(k *s.ConsumerMessage, logger bark.Logger) (c *
 	}
 
 	c.Message.Message = &store.AppendMessage{
-		SequenceNumber: common.Int64Ptr(k.Offset),
+		SequenceNumber: common.Int64Ptr(atomic.AddInt64(&s.seqNo, 1)),
 		EnqueueTimeUtc: common.Int64Ptr(k.Timestamp.UnixNano()),
 	}
 
