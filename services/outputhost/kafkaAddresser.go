@@ -109,6 +109,15 @@ func (k *kafkaTopicPartitionAddresser) GetStoreAddress(tp *topicPartition, offse
 	k.nextTP++
 	k.i2tp[k.nextTP] = tp
 	k.tp2i[*tp] = k.nextTP
+
+	logFn().WithFields(bark.Fields{
+		`module`:    `kafkaAddresser`,
+		`topic`:     tp.Topic,
+		`partition`: tp.Partition,
+		`offset`:    offset,
+		`tpInt`:     k.nextTp,
+	}).Info(`New assignment`)
+	
 	return calc(k.nextTP, offset)
 }
 
